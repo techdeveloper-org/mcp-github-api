@@ -4,7 +4,7 @@
 ![License: MIT](https://img.shields.io/badge/License-MIT-green)
 ![Part of claude-workflow-engine](https://img.shields.io/badge/Part%20of-claude--workflow--engine-lightgrey)
 
-A FastMCP server that exposes GitHub operations as Claude Code tools via stdio JSON-RPC. Provides 12 tools covering the full GitHub development lifecycle: issue creation, branch management, pull request creation and review, merge operations with conflict detection, label management, build validation, and full automated merge cycles. Part of the [Claude Workflow Engine](https://github.com/techdeveloper-org/claude-workflow-engine) ecosystem of 13 MCP servers.
+A FastMCP server that exposes GitHub operations as Claude Code tools via stdio JSON-RPC. Provides 14 tools covering the full GitHub development lifecycle: issue creation, branch management, pull request creation and review, merge operations with conflict detection, label and milestone management, build validation, and full automated merge cycles. Part of the [Claude Workflow Engine](https://github.com/techdeveloper-org/claude-workflow-engine) ecosystem of 13 MCP servers.
 
 ---
 
@@ -15,6 +15,8 @@ A FastMCP server that exposes GitHub operations as Claude Code tools via stdio J
 - Create and merge pull requests (squash, merge, rebase) with `gh` CLI fallback for safety
 - Check PR status, check runs, and merge readiness
 - Add comments to issues and pull requests
+- Create repository labels with idempotent behavior (returns existing on 422)
+- Create sprint milestones with optional due dates and idempotent behavior
 - Auto-commit staged changes and open a PR in a single tool call
 - Build validation before merge — auto-detects npm, Maven, Gradle, Python, and Cargo projects
 - Full merge cycle: build check + mergeability check + merge + branch cleanup in one call
@@ -38,6 +40,8 @@ A FastMCP server that exposes GitHub operations as Claude Code tools via stdio J
 | `github_auto_commit_and_pr` | Stage all changes, commit, push, and open a PR | `title`, `body`, `base`, `labels`, `repo_path` |
 | `github_validate_build` | Run build validation before PR (auto-detects build system) | `repo_path` |
 | `github_label_issue` | Add labels to an issue or PR | `number`, `labels`, `repo_path` |
+| `github_create_label` | Create a repo label — returns existing if already present (idempotent) | `repo`, `name`, `color`, `description` |
+| `github_create_milestone` | Create a sprint milestone — returns existing if title matches (idempotent) | `repo`, `title`, `description`, `due_on`, `state` |
 | `github_full_merge_cycle` | Full cycle: build validate + mergeability + merge + cleanup | `number`, `method`, `validate_build`, `repo_path` |
 
 ### Parameter Details
@@ -67,6 +71,21 @@ A FastMCP server that exposes GitHub operations as Claude Code tools via stdio J
 - `subject` (required) — Subject text used to build branch slug
 - `issue_type` — `"feature"`, `"fix"`, `"refactor"`, `"docs"`, or `"test"` (default: `"feature"`)
 - Branch format produced: `{type}/issue-{number}-{slugified-subject}`
+
+**`github_create_label`**
+- `repo` (required) — Repository in `"owner/repo"` format
+- `name` (required) — Label name, 1–50 characters
+- `color` (required) — 6-character hex color without `#`, e.g. `"0075ca"`. Leading `#` is stripped automatically.
+- `description` — Optional label description (max 1000 chars)
+- Returns `already_exists: true` when the label name already exists instead of raising
+
+**`github_create_milestone`**
+- `repo` (required) — Repository in `"owner/repo"` format
+- `title` (required) — Milestone title, e.g. `"Sprint 1"` (max 255 chars)
+- `description` — Sprint goal or description (max 1000 chars)
+- `due_on` — Due date as `"YYYY-MM-DD"` or `"YYYY-MM-DDTHH:MM:SSZ"`. Omit for no due date.
+- `state` — `"open"` or `"closed"` (default: `"open"`)
+- Returns `already_exists: true` when a milestone with the same title already exists
 
 **`github_full_merge_cycle`**
 - `number` (required) — PR number
@@ -181,6 +200,36 @@ github_full_merge_cycle(
 # Returns: {"pr_number": 15, "method": "squash", "steps": [...], "message": "PR #15 merged successfully"}
 ```
 
+### Set up sprint labels and a milestone (Phase 6 sprint planning)
+
+```python
+# Create a label — safe to call multiple times, returns existing on duplicate
+github_create_label(
+    repo="techdeveloper-org/my-app",
+    name="type:epic",
+    color="0075ca",
+    description="Epic issue grouping feature stories"
+)
+# Returns: {"name": "type:epic", "color": "0075ca", "already_exists": false, ...}
+
+# Call again on the same repo — no error, returns the existing label
+github_create_label(
+    repo="techdeveloper-org/my-app",
+    name="type:epic",
+    color="0075ca"
+)
+# Returns: {"name": "type:epic", "color": "0075ca", "already_exists": true, ...}
+
+# Create a sprint milestone with a due date
+github_create_milestone(
+    repo="techdeveloper-org/my-app",
+    title="Sprint 1",
+    description="Goal: deliver user auth and order creation",
+    due_on="2026-06-13"
+)
+# Returns: {"number": 1, "title": "Sprint 1", "due_on": "2026-06-13T00:00:00", "already_exists": false, ...}
+```
+
 ### Auto-commit and open a PR in one step
 
 ```python
@@ -245,10 +294,21 @@ Step 12:
   github_close_issue(number=issue_number)
 ```
 
+### Phase 6 — Sprint Planning
+
+Before sprint work begins, Phase 6 calls `github_create_label` and `github_create_milestone` to provision the GitHub board for the new sprint. Both tools are idempotent — safe to call on every pipeline run without checking whether labels or milestones already exist.
+
+```
+Phase 6:
+  github_create_label(repo, name, color) × N    -> labels created or confirmed existing
+  github_create_milestone(repo, title, due_on)  -> sprint milestone created or confirmed existing
+```
+
 ### Pipeline Wiring Summary
 
 | Pipeline Step | Tools Used | Purpose |
 |---------------|-----------|---------|
+| Phase 6 | `github_create_label`, `github_create_milestone` | Provision sprint labels and milestone |
 | Step 8 | `github_create_issue` | Track task as a GitHub issue |
 | Step 9 | `github_create_issue_branch` | Create feature branch linked to issue |
 | Step 11 | `github_create_pr`, `github_validate_build`, `github_merge_pr` | PR lifecycle |
