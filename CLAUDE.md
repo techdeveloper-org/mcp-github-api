@@ -35,6 +35,8 @@ Run via `python server.py` — communicates over stdio using the MCP protocol.
 - `github_auto_commit_and_pr` — Commit staged changes and open a PR automatically
 - `github_validate_build` — Wait for CI checks to pass before proceeding
 - `github_label_issue` — Add or remove labels from an issue
+- `github_create_label` — Create a new label in a GitHub repository with idempotent behavior (returns existing if label already exists)
+- `github_create_milestone` — Create a new Milestone (Sprint container) in a GitHub repository with idempotent behavior
 - `github_full_merge_cycle` — Full cycle: build validate -> merge PR -> close issue -> cleanup
 
 ---

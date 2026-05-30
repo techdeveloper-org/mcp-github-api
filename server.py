@@ -5,17 +5,19 @@ Replaces 8+ subprocess calls in github_integration.py with PyGithub library.
 Backend: PyGithub (primary) + gh CLI fallback for critical operations
 Transport: stdio
 
-Tools (12):
+Tools (14):
   github_create_issue, github_close_issue, github_add_comment,
   github_create_pr, github_merge_pr, github_list_issues, github_get_pr_status,
   github_create_issue_branch, github_auto_commit_and_pr, github_validate_build,
-  github_label_issue, github_full_merge_cycle
+  github_label_issue, github_create_label, github_create_milestone,
+  github_full_merge_cycle
 """
 
 import json
 import subprocess
 import sys
 from pathlib import Path
+from datetime import datetime
 from typing import Optional
 
 # Ensure src/mcp/ is in path for base package imports
@@ -25,6 +27,7 @@ from mcp.server.fastmcp import FastMCP
 
 from base.decorators import mcp_tool_handler
 from base.clients import GitHubApiClient, GitRepoClient
+from input_validator import validate_input
 
 try:
     from github import GithubException
@@ -559,6 +562,177 @@ def github_label_issue(
         "labels_added": added,
         "total_labels": [lbl.name for lbl in issue.labels]
     }
+
+
+@mcp.tool()
+@mcp_tool_handler
+def github_create_label(
+    repo: str,
+    name: str,
+    color: str,
+    description: str = ""
+) -> dict:
+    """Create a new label in a GitHub repository.
+
+    Creates the label with the given name, hex color, and optional description.
+    Returns the existing label (with already_exists: true) if the label name
+    already exists -- enabling idempotent pipeline calls.
+
+    Args:
+        repo: Repository in 'owner/repo' format, e.g. 'techdeveloper-org/my-app'.
+        name: Label name (1-50 characters).
+        color: Hex color without '#', e.g. '0075ca'. Leading '#' is stripped if present.
+        description: Optional label description.
+
+    Returns:
+        Dict with name, color, description, url, already_exists fields.
+
+    Raises:
+        ValueError: If repo format is invalid, name exceeds 50 chars, color is not
+            valid hex, description exceeds 1000 chars, or repo is inaccessible.
+    """
+    repo = validate_input(repo, max_length=200, field_name="repo")
+    if not repo or "/" not in repo or repo.startswith("/") or repo.endswith("/"):
+        raise ValueError("repo must be in 'owner/repo' format")
+
+    name = validate_input(name, max_length=50, field_name="name")
+    if not name or len(name) > 50:
+        raise ValueError("Label name must be 1-50 characters")
+
+    color = color.lstrip("#")
+    if len(color) != 6 or not all(c in "0123456789abcdefABCDEF" for c in color):
+        raise ValueError("Color must be 6 hex characters without #")
+
+    description = validate_input(description, max_length=1000, field_name="description")
+
+    client = GitHubApiClient.instance().get_or_raise()
+    gh_repo = client.get_repo(repo)
+
+    try:
+        label = gh_repo.create_label(name=name, color=color, description=description)
+        return {
+            "name": label.name,
+            "color": label.color,
+            "description": label.description or "",
+            "url": label.url,
+            "already_exists": False
+        }
+    except GithubException as e:
+        if e.status == 422:
+            try:
+                existing = gh_repo.get_label(name)
+                return {
+                    "name": existing.name,
+                    "color": existing.color,
+                    "description": existing.description or "",
+                    "url": existing.url,
+                    "already_exists": True
+                }
+            except GithubException:
+                raise ValueError(f"Label '{name}' conflict but could not be retrieved")
+        if e.status == 404:
+            raise ValueError(f"Repository {repo} not found or no access")
+        if e.status == 403:
+            raise ValueError(f"Token lacks write permission on {repo}")
+        raise
+
+
+@mcp.tool()
+@mcp_tool_handler
+def github_create_milestone(
+    repo: str,
+    title: str,
+    description: str = "",
+    due_on: str = "",
+    state: str = "open"
+) -> dict:
+    """Create a new Milestone in a GitHub repository.
+
+    Milestones act as Sprint containers in the GitHub Issues-based sprint planning
+    workflow. Issues assigned to a milestone form the sprint backlog.
+    Returns the existing milestone (with already_exists: true) if a milestone with
+    the same title already exists -- enabling idempotent pipeline calls.
+
+    Args:
+        repo: Repository in 'owner/repo' format, e.g. 'techdeveloper-org/my-app'.
+        title: Milestone title, e.g. 'Sprint 1'.
+        description: Sprint goal or milestone description.
+        due_on: Due date as 'YYYY-MM-DD' or 'YYYY-MM-DDTHH:MM:SSZ'. Empty = no due date.
+        state: 'open' or 'closed' (default: 'open').
+
+    Returns:
+        Dict with number, title, description, due_on, state, open_issues, html_url,
+        already_exists fields.
+
+    Raises:
+        ValueError: If repo format is invalid, title is empty or exceeds 255 chars,
+            description exceeds 1000 chars, state is invalid, due_on format is
+            unrecognized, or repo is inaccessible.
+    """
+    repo = validate_input(repo, max_length=200, field_name="repo")
+    if not repo or "/" not in repo or repo.startswith("/") or repo.endswith("/"):
+        raise ValueError("repo must be in 'owner/repo' format")
+
+    title = validate_input(title, max_length=255, field_name="title")
+    if not title:
+        raise ValueError("Milestone title must not be empty")
+
+    description = validate_input(description, max_length=1000, field_name="description")
+
+    if state not in ("open", "closed"):
+        raise ValueError("state must be 'open' or 'closed'")
+
+    due_date = None
+    if due_on:
+        for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d"):
+            try:
+                due_date = datetime.strptime(due_on.strip(), fmt)
+                break
+            except ValueError:
+                continue
+        if due_date is None:
+            raise ValueError("due_on must be YYYY-MM-DD or ISO 8601 format")
+
+    client = GitHubApiClient.instance().get_or_raise()
+    gh_repo = client.get_repo(repo)
+
+    kwargs = {"title": title, "state": state, "description": description}
+    if due_date:
+        kwargs["due_on"] = due_date
+
+    try:
+        ms = gh_repo.create_milestone(**kwargs)
+        return {
+            "number": ms.number,
+            "title": ms.title,
+            "description": ms.description or "",
+            "due_on": ms.due_on.isoformat() if ms.due_on else None,
+            "state": ms.state,
+            "open_issues": ms.open_issues,
+            "html_url": ms.html_url,
+            "already_exists": False
+        }
+    except GithubException as e:
+        if e.status == 422:
+            for i, existing in enumerate(gh_repo.get_milestones(state="all")):
+                if i >= 500:
+                    raise ValueError(f"Milestone '{title}' not found in first 500 milestones")
+                if existing.title == title:
+                    return {
+                        "number": existing.number,
+                        "title": existing.title,
+                        "description": existing.description or "",
+                        "due_on": existing.due_on.isoformat() if existing.due_on else None,
+                        "state": existing.state,
+                        "open_issues": existing.open_issues,
+                        "html_url": existing.html_url,
+                        "already_exists": True
+                    }
+        if e.status == 404:
+            raise ValueError(f"Repository {repo} not found or no access")
+        if e.status == 403:
+            raise ValueError(f"Token lacks write permission on {repo}")
+        raise
 
 
 @mcp.tool()
