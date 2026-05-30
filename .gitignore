@@ -17,3 +17,6 @@ build/
 *.jsonl
 sessions/
 .qdrant/
+
+# Generated audit reports
+docs/reports/

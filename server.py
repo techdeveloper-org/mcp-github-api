@@ -17,6 +17,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from datetime import datetime
 from typing import Optional
 
 # Ensure src/mcp/ is in path for base package imports
@@ -579,11 +580,9 @@ def github_create_label(
 
     Args:
         repo: Repository in 'owner/repo' format, e.g. 'techdeveloper-org/my-app'.
-            repo must be in 'owner/repo' format (validated before any API call).
         name: Label name (1-50 characters).
         color: Hex color without '#', e.g. '0075ca'. Leading '#' is stripped if present.
-        description: Optional human-readable description for the label.
-            description capped at 1000 chars (null bytes stripped, whitespace trimmed).
+        description: Optional label description.
 
     Returns:
         Dict with name, color, description, url, already_exists fields.
@@ -596,6 +595,7 @@ def github_create_label(
     if not repo or "/" not in repo or repo.startswith("/") or repo.endswith("/"):
         raise ValueError("repo must be in 'owner/repo' format")
 
+    name = validate_input(name, max_length=50, field_name="name")
     if not name or len(name) > 50:
         raise ValueError("Label name must be 1-50 characters")
 
@@ -655,11 +655,8 @@ def github_create_milestone(
 
     Args:
         repo: Repository in 'owner/repo' format, e.g. 'techdeveloper-org/my-app'.
-            repo must be in 'owner/repo' format (validated before any API call).
-        title: Milestone title, e.g. 'Sprint 1'. title capped at 255 chars
-            (null bytes stripped, whitespace trimmed).
+        title: Milestone title, e.g. 'Sprint 1'.
         description: Sprint goal or milestone description.
-            description capped at 1000 chars (null bytes stripped, whitespace trimmed).
         due_on: Due date as 'YYYY-MM-DD' or 'YYYY-MM-DDTHH:MM:SSZ'. Empty = no due date.
         state: 'open' or 'closed' (default: 'open').
 
@@ -672,16 +669,14 @@ def github_create_milestone(
             description exceeds 1000 chars, state is invalid, due_on format is
             unrecognized, or repo is inaccessible.
     """
-    from datetime import datetime
-
     repo = validate_input(repo, max_length=200, field_name="repo")
     if not repo or "/" not in repo or repo.startswith("/") or repo.endswith("/"):
         raise ValueError("repo must be in 'owner/repo' format")
 
+    title = validate_input(title, max_length=255, field_name="title")
     if not title:
         raise ValueError("Milestone title must not be empty")
 
-    title = validate_input(title, max_length=255, field_name="title")
     description = validate_input(description, max_length=1000, field_name="description")
 
     if state not in ("open", "closed"):
@@ -721,7 +716,7 @@ def github_create_milestone(
         if e.status == 422:
             for i, existing in enumerate(gh_repo.get_milestones(state="all")):
                 if i >= 500:
-                    break
+                    raise ValueError(f"Milestone '{title}' not found in first 500 milestones")
                 if existing.title == title:
                     return {
                         "number": existing.number,

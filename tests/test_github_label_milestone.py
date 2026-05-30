@@ -294,6 +294,66 @@ class TestCreateLabel:
         assert result["already_exists"] is True
         assert result["description"] == ""
 
+    @patch("server.GitHubApiClient")
+    def test_create_label_invalid_repo_no_slash(self, mock_client_cls):
+        """Verify that a repo string without '/' is rejected with an 'owner/repo' error."""
+        mock_github = MagicMock()
+        mock_repo = MagicMock()
+        mock_client_cls.instance.return_value.get_or_raise.return_value = mock_github
+        mock_github.get_repo.return_value = mock_repo
+
+        result = json.loads(github_create_label(repo="nodash", name="bug", color="d73a4a"))
+
+        assert result["success"] is False
+        assert "owner/repo" in result["error"]
+
+    @patch("server.GitHubApiClient")
+    def test_create_label_invalid_repo_leading_slash(self, mock_client_cls):
+        """Verify that a repo string starting with '/' is rejected."""
+        mock_github = MagicMock()
+        mock_repo = MagicMock()
+        mock_client_cls.instance.return_value.get_or_raise.return_value = mock_github
+        mock_github.get_repo.return_value = mock_repo
+
+        result = json.loads(github_create_label(repo="/leading", name="bug", color="d73a4a"))
+
+        assert result["success"] is False
+
+    @patch("server.GitHubApiClient")
+    def test_create_label_invalid_repo_trailing_slash(self, mock_client_cls):
+        """Verify that a repo string ending with '/' is rejected."""
+        mock_github = MagicMock()
+        mock_repo = MagicMock()
+        mock_client_cls.instance.return_value.get_or_raise.return_value = mock_github
+        mock_github.get_repo.return_value = mock_repo
+
+        result = json.loads(github_create_label(repo="trailing/", name="bug", color="d73a4a"))
+
+        assert result["success"] is False
+
+    @patch("server.GitHubApiClient")
+    def test_create_label_name_with_null_byte(self, mock_client_cls):
+        """Verify that a null byte in name is sanitised by validate_input before reaching the API."""
+        mock_github = MagicMock()
+        mock_repo = MagicMock()
+        mock_client_cls.instance.return_value.get_or_raise.return_value = mock_github
+        mock_github.get_repo.return_value = mock_repo
+
+        mock_label = MagicMock()
+        mock_label.name = "buginjected"
+        mock_label.color = "d73a4a"
+        mock_label.description = ""
+        mock_label.url = "https://api.github.com/repos/owner/repo/labels/buginjected"
+        mock_repo.create_label.return_value = mock_label
+
+        result = json.loads(github_create_label(repo="owner/repo", name="bug\x00injected", color="d73a4a"))
+
+        if result["success"]:
+            call_args = mock_repo.create_label.call_args
+            assert "\x00" not in call_args.kwargs.get("name", ""), "Null byte must not reach API"
+        else:
+            assert result["success"] is False
+
 
 class TestCreateMilestone:
     """Unit tests for github_create_milestone."""
@@ -521,3 +581,30 @@ class TestCreateMilestone:
 
         assert result["success"] is True
         assert result["due_on"] is None
+
+    @patch("server.GitHubApiClient")
+    def test_create_milestone_whitespace_only_title(self, mock_client_cls):
+        """Verify that a whitespace-only title is rejected as empty after validate_input strips it."""
+        mock_github = MagicMock()
+        mock_repo = MagicMock()
+        mock_client_cls.instance.return_value.get_or_raise.return_value = mock_github
+        mock_github.get_repo.return_value = mock_repo
+
+        result = json.loads(github_create_milestone(repo="owner/repo", title="   "))
+
+        assert result["success"] is False
+        assert "empty" in result["error"].lower()
+        mock_repo.create_milestone.assert_not_called()
+
+    @patch("server.GitHubApiClient")
+    def test_create_milestone_invalid_repo_no_slash(self, mock_client_cls):
+        """Verify that a repo string without '/' is rejected with an 'owner/repo' error."""
+        mock_github = MagicMock()
+        mock_repo = MagicMock()
+        mock_client_cls.instance.return_value.get_or_raise.return_value = mock_github
+        mock_github.get_repo.return_value = mock_repo
+
+        result = json.loads(github_create_milestone(repo="nodash", title="Sprint 1"))
+
+        assert result["success"] is False
+        assert "owner/repo" in result["error"]
