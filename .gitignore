@@ -20,3 +20,10 @@ sessions/
 
 # Generated audit reports
 docs/reports/
+
+# Coverage and test artifacts. A stray .coverage file sat untracked in this repo
+# for two months; nothing here should ever be committed.
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
