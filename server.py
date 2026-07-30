@@ -23,7 +23,13 @@ from typing import Optional
 # Ensure src/mcp/ is in path for base package imports
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from mcp.server.fastmcp import FastMCP
+# mcp 2.0 renamed FastMCP to MCPServer and moved it to mcp.server.mcpserver.
+# Both names are probed so this server runs under either major version; the
+# API used below (tool decorator, run(transport=...)) is identical in both.
+try:
+    from mcp.server.mcpserver import MCPServer
+except ImportError:  # mcp < 2.0
+    from mcp.server.fastmcp import FastMCP as MCPServer
 
 from base.decorators import mcp_tool_handler
 from base.clients import GitHubApiClient, GitRepoClient
@@ -34,7 +40,7 @@ try:
 except ImportError:
     GithubException = Exception  # Fallback so except clauses don't fail
 
-mcp = FastMCP("github-api", instructions="GitHub operations via PyGithub (no subprocess)")
+mcp = MCPServer("github-api", instructions="GitHub operations via PyGithub (no subprocess)")
 
 
 def _gh_cli_merge_fallback(number: int, method: str, delete_branch: bool,
