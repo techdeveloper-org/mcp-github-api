@@ -298,6 +298,28 @@ class GitRepoClient(LazyClient):
         return None
 
 
+_IDEMPOTENT_METHODS = frozenset(
+    {"GET", "HEAD", "OPTIONS", "PUT", "DELETE", "TRACE"}
+)
+"""HTTP methods that are safe to retry automatically.
+
+Deliberately excludes POST and PATCH. PyGithub's ``GithubRetry`` adds POST to
+urllib3's allowed-methods set, which urllib3 itself omits by design, and pairs
+it with ``total=10`` and a ``status_forcelist`` spanning 500-599 plus 403. A
+write that GitHub accepts and processes, but whose response is slow past the
+15-second default timeout or returns a 5xx afterwards, is therefore retried --
+creating the resource a second time.
+
+This was observed, not theorised: a single ``github_create_issue`` call produced
+issues #256 and #257 on techdeveloper-org/claude-workflow-engine, identical in
+title and labels, 42 seconds apart. Retrying a non-idempotent write cannot be
+made safe without a server-side idempotency key, which the GitHub REST API does
+not offer for issue creation, so the retry is removed instead.
+
+Reads keep the full retry budget; only unsafe methods lose it.
+"""
+
+
 class GitHubApiClient(LazyClient):
     """Lazy PyGithub client with automatic token resolution.
 
@@ -323,6 +345,7 @@ class GitHubApiClient(LazyClient):
         """
         try:
             from github import Github
+            from github.GithubRetry import GithubRetry
         except ImportError:
             raise RuntimeError(
                 "PyGithub not installed. Install with: pip install PyGithub"
@@ -335,7 +358,9 @@ class GitHubApiClient(LazyClient):
                 "login with: gh auth login"
             )
 
-        return Github(token)
+        return Github(token, retry=GithubRetry(
+            total=10, allowed_methods=_IDEMPOTENT_METHODS
+        ))
 
     @staticmethod
     def _resolve_token() -> Optional[str]:
