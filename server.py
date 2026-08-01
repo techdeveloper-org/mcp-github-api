@@ -265,14 +265,33 @@ def github_merge_pr(
 def github_list_issues(
     labels: Optional[str] = None,
     state: str = "open",
-    repo_path: str = "."
+    repo_path: str = ".",
+    limit: int = 100
 ) -> dict:
-    """List issues in the repository.
+    """List issues in the repository, excluding pull requests.
+
+    The returned ``truncated`` flag reports whether more issues matched than
+    were returned. A caller that treats an un-flagged short result as complete
+    is safe; a caller that ignores the flag is not. This matters because the
+    previous implementation sliced the first 25 results silently, and callers
+    read the short list as exhaustive.
+
+    Pull requests are filtered before the limit is applied, not after. GitHub
+    shares one number space between issues and PRs, so slicing first meant a
+    repository with many PRs could return far fewer than ``limit`` issues while
+    more existed -- on one observed run, 9 issues came back from 25 fetched
+    rows while the number space reached 257.
 
     Args:
         labels: Comma-separated label filter
         state: 'open', 'closed', or 'all'
         repo_path: Local repo path
+        limit: Maximum issues to return. Pagination is handled by PyGithub, so
+            raising this costs additional API calls rather than failing.
+
+    Returns:
+        Dict with ``issues``, ``count``, ``truncated`` and the effective
+        ``limit``.
     """
     repo = GitHubApiClient.instance().get_repo(repo_path)
 
@@ -282,19 +301,26 @@ def github_list_issues(
         kwargs["labels"] = [repo.get_label(lbl) for lbl in label_list]
 
     issues = []
-    for issue in repo.get_issues(**kwargs)[:25]:
-        if not issue.pull_request:  # Exclude PRs
-            issues.append({
-                "number": issue.number,
-                "title": issue.title,
-                "state": issue.state,
-                "labels": [lbl.name for lbl in issue.labels],
-                "created_at": issue.created_at.isoformat()
-            })
+    truncated = False
+    for issue in repo.get_issues(**kwargs):
+        if issue.pull_request:
+            continue
+        if len(issues) >= limit:
+            truncated = True
+            break
+        issues.append({
+            "number": issue.number,
+            "title": issue.title,
+            "state": issue.state,
+            "labels": [lbl.name for lbl in issue.labels],
+            "created_at": issue.created_at.isoformat()
+        })
 
     return {
         "issues": issues,
-        "count": len(issues)
+        "count": len(issues),
+        "truncated": truncated,
+        "limit": limit
     }
 
 
