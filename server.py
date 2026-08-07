@@ -31,9 +31,15 @@ try:
 except ImportError:  # mcp < 2.0
     from mcp.server.fastmcp import FastMCP as MCPServer
 
+try:
+    from mcp.types import ToolAnnotations
+except ImportError:  # pragma: no cover - annotations unsupported on this mcp
+    ToolAnnotations = None
+
 from base.decorators import mcp_tool_handler
 from base.clients import GitHubApiClient, GitRepoClient
 from input_validator import validate_input
+from idempotency import run_once
 
 try:
     from github import GithubException
@@ -43,41 +49,138 @@ except ImportError:
 mcp = MCPServer("github-api", instructions="GitHub operations via PyGithub (no subprocess)")
 
 
+def _tool(read_only=False, destructive=True, idempotent=False, open_world=True):
+    """Register a tool with explicit MCP ToolAnnotations.
+
+    The MCP specification's per-hint defaults are readOnlyHint=false,
+    destructiveHint=true, idempotentHint=false and openWorldHint=true -- every
+    default points at the more dangerous value, so an unannotated tool is
+    indistinguishable from an explicit worst-case declaration. A host may
+    therefore refuse to auto-approve it, or conversely may auto-retry a tool
+    whose retry-safety was never actually established. Every tool on this server
+    declares its four hints explicitly so that auto-approval and automatic retry
+    decisions rest on a stated property rather than on an omission.
+
+    Args:
+        read_only: True when the tool has no side effects at all.
+        destructive: True when the tool's effect is irreversible.
+        idempotent: True only when repeating the call with identical arguments
+            leaves the same cumulative effect as a single call. A tool that is
+            merely made retry-safe by a caller-supplied idempotency key does not
+            qualify: the underlying operation is still non-idempotent and the
+            protection is conditional on the caller reusing the key.
+        open_world: True when the tool reaches an external system.
+
+    Returns:
+        The decorator returned by the underlying MCP tool registration.
+    """
+    if ToolAnnotations is None:
+        return mcp.tool()
+    try:
+        return mcp.tool(
+            annotations=ToolAnnotations(
+                readOnlyHint=read_only,
+                destructiveHint=destructive,
+                idempotentHint=idempotent,
+                openWorldHint=open_world,
+            )
+        )
+    except TypeError:  # pragma: no cover - older mcp without annotations kwarg
+        return mcp.tool()
+
+
 def _gh_cli_merge_fallback(number: int, method: str, delete_branch: bool,
                            commit_message: str) -> Optional[dict]:
-    """Fallback: merge PR via gh CLI if PyGithub fails."""
+    """Fallback: merge PR via gh CLI if PyGithub fails.
+
+    Args:
+        number: PR number to merge.
+        method: Merge method ('merge', 'squash', 'rebase').
+        delete_branch: Whether to delete the head branch after merging.
+        commit_message: Merge commit body.
+
+    Returns:
+        A result dict on success, or None when the CLI is unavailable or the
+        merge command failed. The failure reason is carried in the returned
+        dict rather than discarded, so the caller can surface why the fallback
+        did not help instead of reporting a bare re-raised primary error.
+    """
+    cmd = ["gh", "pr", "merge", str(number), f"--{method}"]
+    if delete_branch:
+        cmd.append("--delete-branch")
+    if commit_message:
+        cmd.extend(["--body", commit_message])
+
     try:
-        cmd = ["gh", "pr", "merge", str(number), f"--{method}"]
-        if delete_branch:
-            cmd.append("--delete-branch")
-        if commit_message:
-            cmd.extend(["--body", commit_message])
-
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if result.returncode == 0:
-            return {
-                "success": True,
-                "pr_number": number,
-                "merged": True,
-                "method": method,
-                "branch_deleted": delete_branch,
-                "fallback": "gh_cli"
-            }
+    except (FileNotFoundError, OSError, subprocess.SubprocessError) as exc:
+        return {
+            "success": False,
+            "pr_number": number,
+            "merged": False,
+            "fallback": "gh_cli",
+            "fallback_error": f"{type(exc).__name__}: {exc}",
+        }
+
+    if result.returncode == 0:
+        return {
+            "success": True,
+            "pr_number": number,
+            "merged": True,
+            "method": method,
+            "branch_deleted": delete_branch,
+            "fallback": "gh_cli"
+        }
+    return {
+        "success": False,
+        "pr_number": number,
+        "merged": False,
+        "fallback": "gh_cli",
+        "fallback_error": (result.stderr or result.stdout or "").strip()[:500],
+        "fallback_exit_code": result.returncode,
+    }
+
+
+def _pr_is_merged(number: int, repo_path: str) -> bool:
+    """Re-read a pull request and report whether it is already merged.
+
+    Used on the merge failure path to distinguish "the merge never happened"
+    from "the merge happened and only the acknowledgment was lost". Returns
+    False when the state cannot be established, so an unverifiable outcome
+    never masquerades as a completed merge.
+
+    Args:
+        number: PR number.
+        repo_path: Local repo path used to resolve owner/repo.
+
+    Returns:
+        True only when GitHub confirms the PR is merged.
+    """
+    try:
+        repo = GitHubApiClient.instance().get_repo(repo_path)
+        return bool(repo.get_pull(number).merged)
     except Exception:
-        pass
-    return None
+        return False
 
 
-@mcp.tool()
+@_tool(read_only=False, destructive=False, idempotent=False, open_world=True)
 @mcp_tool_handler
 def github_create_issue(
     title: str,
     body: str = "",
     labels: Optional[str] = None,
     assignee: Optional[str] = None,
-    repo_path: str = "."
+    repo_path: str = ".",
+    idempotency_key: Optional[str] = None
 ) -> dict:
     """Create a GitHub issue.
+
+    Creating an issue is not idempotent: the GitHub API has no natural
+    de-duplication, so a retry after a lost response files a second issue.
+    Supply ``idempotency_key`` to make a retry safe. Generate that key once,
+    when you decide to file the issue, and send the same value on every retry
+    of that same decision -- a key regenerated per attempt provides no
+    protection at all.
 
     Args:
         title: Issue title
@@ -85,25 +188,36 @@ def github_create_issue(
         labels: Comma-separated label names (e.g., 'bug,priority-high')
         assignee: GitHub username to assign the issue to
         repo_path: Local repo path for auto-detecting owner/repo
+        idempotency_key: Optional caller-generated key scoped to one logical
+            issue-creation intent. When a previously completed key is replayed,
+            the original result is returned with ``idempotent_replay`` true and
+            no second issue is filed.
     """
-    repo = GitHubApiClient.instance().get_repo(repo_path)
-    label_list = [lbl.strip() for lbl in labels.split(",") if lbl.strip()] if labels else []
+    def _create() -> dict:
+        """Perform the underlying non-idempotent issue creation."""
+        repo = GitHubApiClient.instance().get_repo(repo_path)
+        label_list = (
+            [lbl.strip() for lbl in labels.split(",") if lbl.strip()]
+            if labels else []
+        )
 
-    kwargs = {"title": title, "body": body, "labels": label_list}
-    if assignee:
-        kwargs["assignee"] = assignee
+        kwargs = {"title": title, "body": body, "labels": label_list}
+        if assignee:
+            kwargs["assignee"] = assignee
 
-    issue = repo.create_issue(**kwargs)
+        issue = repo.create_issue(**kwargs)
 
-    return {
-        "issue_number": issue.number,
-        "issue_url": issue.html_url,
-        "assignee": assignee,
-        "created_at": issue.created_at.isoformat()
-    }
+        return {
+            "issue_number": issue.number,
+            "issue_url": issue.html_url,
+            "assignee": assignee,
+            "created_at": issue.created_at.isoformat()
+        }
+
+    return run_once("github_create_issue", idempotency_key, _create)
 
 
-@mcp.tool()
+@_tool(read_only=False, destructive=False, idempotent=False, open_world=True)
 @mcp_tool_handler
 def github_close_issue(
     number: int,
@@ -131,7 +245,7 @@ def github_close_issue(
     }
 
 
-@mcp.tool()
+@_tool(read_only=False, destructive=False, idempotent=False, open_world=True)
 @mcp_tool_handler
 def github_add_comment(
     number: int,
@@ -162,7 +276,7 @@ def github_add_comment(
     }
 
 
-@mcp.tool()
+@_tool(read_only=False, destructive=False, idempotent=False, open_world=True)
 @mcp_tool_handler
 def github_create_pr(
     title: str,
@@ -170,9 +284,16 @@ def github_create_pr(
     head: str = "",
     base: str = "main",
     labels: Optional[str] = None,
-    repo_path: str = "."
+    repo_path: str = ".",
+    idempotency_key: Optional[str] = None
 ) -> dict:
     """Create a pull request.
+
+    Opening a PR is not idempotent. GitHub rejects a second open PR for the
+    same head/base pair, but a retry issued after a lost response still costs a
+    confusing 422 that is indistinguishable from a genuine conflict. Supply
+    ``idempotency_key`` -- generated once per logical intent and reused
+    unchanged across every retry -- to replay the original result instead.
 
     Args:
         title: PR title
@@ -181,29 +302,41 @@ def github_create_pr(
         base: Target branch (default: main)
         labels: Comma-separated label names
         repo_path: Local repo path
+        idempotency_key: Optional caller-generated key scoped to one logical
+            PR-creation intent.
+
+    Returns:
+        Dict with pr_number, pr_url, created_at, and labels_failed listing any
+        label that could not be attached.
     """
     if not head:
         raise ValueError("head branch is required")
 
-    repo = GitHubApiClient.instance().get_repo(repo_path)
-    pr = repo.create_pull(title=title, body=body, head=head, base=base)
+    def _create() -> dict:
+        """Perform the underlying non-idempotent pull request creation."""
+        repo = GitHubApiClient.instance().get_repo(repo_path)
+        pr = repo.create_pull(title=title, body=body, head=head, base=base)
 
-    if labels:
-        label_list = [lbl.strip() for lbl in labels.split(",") if lbl.strip()]
-        for label in label_list:
-            try:
-                pr.add_to_labels(label)
-            except GithubException:
-                pass
+        labels_failed = []
+        if labels:
+            label_list = [lbl.strip() for lbl in labels.split(",") if lbl.strip()]
+            for label in label_list:
+                try:
+                    pr.add_to_labels(label)
+                except GithubException as exc:
+                    labels_failed.append({"label": label, "error": str(exc)[:200]})
 
-    return {
-        "pr_number": pr.number,
-        "pr_url": pr.html_url,
-        "created_at": pr.created_at.isoformat()
-    }
+        return {
+            "pr_number": pr.number,
+            "pr_url": pr.html_url,
+            "created_at": pr.created_at.isoformat(),
+            "labels_failed": labels_failed
+        }
+
+    return run_once("github_create_pr", idempotency_key, _create)
 
 
-@mcp.tool()
+@_tool(read_only=False, destructive=True, idempotent=False, open_world=True)
 @mcp_tool_handler
 def github_merge_pr(
     number: int,
@@ -213,6 +346,19 @@ def github_merge_pr(
     repo_path: str = "."
 ) -> dict:
     """Merge a pull request with gh CLI fallback for safety.
+
+    Merging is irreversible, so the failure path is deliberately conservative.
+    If the PyGithub merge call raises, the PR state is re-read before anything
+    else happens: a merge that landed server-side but whose response was lost
+    reports ``merged`` true on that re-read, and this tool returns success
+    rather than re-issuing the merge through the CLI. Falling back blindly on
+    any exception would turn an ambiguous outcome into a second merge attempt
+    against a repository whose state has already changed.
+
+    ``pr.mergeable`` is null while GitHub computes mergeability in the
+    background. Null is reported as unknown rather than collapsed into
+    "conflicts exist", because treating a pending computation as a conflict
+    blocks merges that would have succeeded moments later.
 
     Args:
         number: PR number
@@ -228,7 +374,25 @@ def github_merge_pr(
         repo = GitHubApiClient.instance().get_repo(repo_path)
         pr = repo.get_pull(number)
 
-        if not pr.mergeable:
+        if pr.merged:
+            return {
+                "pr_number": number,
+                "merged": True,
+                "method": method,
+                "branch_deleted": False,
+                "already_merged": True
+            }
+
+        if pr.mergeable is None:
+            return {
+                "success": False,
+                "error": (
+                    f"PR #{number} mergeability is still being computed by "
+                    "GitHub. Retry shortly; do not treat this as a conflict."
+                )
+            }
+
+        if pr.mergeable is False:
             return {
                 "success": False,
                 "error": f"PR #{number} is not mergeable (conflicts exist)"
@@ -239,40 +403,83 @@ def github_merge_pr(
             merge_method=method
         )
 
+        branch_deleted = False
+        branch_delete_error = None
         if delete_branch:
             try:
                 ref = repo.get_git_ref(f"heads/{pr.head.ref}")
                 ref.delete()
-            except GithubException:
-                pass
+                branch_deleted = True
+            except GithubException as exc:
+                branch_delete_error = str(exc)[:200]
 
-        return {
+        result = {
             "pr_number": number,
             "merged": True,
             "method": method,
-            "branch_deleted": delete_branch
+            "branch_deleted": branch_deleted
         }
-    except Exception:
-        # Fallback: gh CLI for critical merge operation
+        if branch_delete_error:
+            result["branch_delete_error"] = branch_delete_error
+        return result
+    except Exception as primary_err:
+        if _pr_is_merged(number, repo_path):
+            return {
+                "pr_number": number,
+                "merged": True,
+                "method": method,
+                "branch_deleted": False,
+                "already_merged": True,
+                "note": (
+                    "The merge landed upstream but the API call raised "
+                    f"({type(primary_err).__name__}). No second merge was "
+                    "attempted."
+                )
+            }
+
         fallback = _gh_cli_merge_fallback(number, method, delete_branch, merge_msg)
-        if fallback:
+        if fallback and fallback.get("success"):
             return fallback
+        if fallback:
+            raise RuntimeError(
+                f"Merge of PR #{number} failed. Primary: {primary_err}. "
+                f"Fallback: {fallback.get('fallback_error', 'unknown')}"
+            ) from primary_err
         raise
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def github_list_issues(
     labels: Optional[str] = None,
     state: str = "open",
-    repo_path: str = "."
+    repo_path: str = ".",
+    limit: int = 100
 ) -> dict:
-    """List issues in the repository.
+    """List issues in the repository, excluding pull requests.
+
+    The returned ``truncated`` flag reports whether more issues matched than
+    were returned. A caller that treats an un-flagged short result as complete
+    is safe; a caller that ignores the flag is not. This matters because the
+    previous implementation sliced the first 25 results silently, and callers
+    read the short list as exhaustive.
+
+    Pull requests are filtered before the limit is applied, not after. GitHub
+    shares one number space between issues and PRs, so slicing first meant a
+    repository with many PRs could return far fewer than ``limit`` issues while
+    more existed -- on one observed run, 9 issues came back from 25 fetched
+    rows while the number space reached 257.
 
     Args:
         labels: Comma-separated label filter
         state: 'open', 'closed', or 'all'
         repo_path: Local repo path
+        limit: Maximum issues to return. Pagination is handled by PyGithub, so
+            raising this costs additional API calls rather than failing.
+
+    Returns:
+        Dict with ``issues``, ``count``, ``truncated`` and the effective
+        ``limit``.
     """
     repo = GitHubApiClient.instance().get_repo(repo_path)
 
@@ -282,23 +489,30 @@ def github_list_issues(
         kwargs["labels"] = [repo.get_label(lbl) for lbl in label_list]
 
     issues = []
-    for issue in repo.get_issues(**kwargs)[:25]:
-        if not issue.pull_request:  # Exclude PRs
-            issues.append({
-                "number": issue.number,
-                "title": issue.title,
-                "state": issue.state,
-                "labels": [lbl.name for lbl in issue.labels],
-                "created_at": issue.created_at.isoformat()
-            })
+    truncated = False
+    for issue in repo.get_issues(**kwargs):
+        if issue.pull_request:
+            continue
+        if len(issues) >= limit:
+            truncated = True
+            break
+        issues.append({
+            "number": issue.number,
+            "title": issue.title,
+            "state": issue.state,
+            "labels": [lbl.name for lbl in issue.labels],
+            "created_at": issue.created_at.isoformat()
+        })
 
     return {
         "issues": issues,
-        "count": len(issues)
+        "count": len(issues),
+        "truncated": truncated,
+        "limit": limit
     }
 
 
-@mcp.tool()
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def github_get_pr_status(number: int, repo_path: str = ".") -> dict:
     """Get pull request status and check details.
@@ -340,7 +554,7 @@ def github_get_pr_status(number: int, repo_path: str = ".") -> dict:
 # PR WORKFLOW + ISSUE MANAGEMENT (Enhanced from github_pr_workflow.py + github_issue_manager.py)
 # =============================================================================
 
-@mcp.tool()
+@_tool(read_only=False, destructive=False, idempotent=False, open_world=True)
 @mcp_tool_handler
 def github_create_issue_branch(
     issue_number: int,
@@ -416,18 +630,25 @@ def github_create_issue_branch(
         }
 
 
-@mcp.tool()
+@_tool(read_only=False, destructive=False, idempotent=False, open_world=True)
 @mcp_tool_handler
 def github_auto_commit_and_pr(
     title: str,
     body: str = "",
     base: str = "main",
     labels: Optional[str] = None,
-    repo_path: str = "."
+    repo_path: str = ".",
+    idempotency_key: Optional[str] = None
 ) -> dict:
     """Auto-commit all changes and create a PR in one step.
 
     Workflow: stage all -> commit -> push -> create PR
+
+    This composes three non-idempotent steps and is the most damaging tool on
+    this server to retry blind: a retry after a lost response can produce a
+    second commit and a second PR. Supply ``idempotency_key``, generated once
+    per logical intent and reused unchanged across every retry, so a repeat
+    call replays the recorded outcome instead of re-running the workflow.
 
     Args:
         title: PR title (also used as commit message)
@@ -435,46 +656,56 @@ def github_auto_commit_and_pr(
         base: Target branch
         labels: Comma-separated labels
         repo_path: Local repo path
+        idempotency_key: Optional caller-generated key scoped to one logical
+            commit-and-open-PR intent.
+
+    Returns:
+        Dict with commit, branch, pr_number, pr_url, and labels_failed listing
+        any label that could not be attached.
     """
-    repo = GitRepoClient.for_path(repo_path)
+    def _commit_and_open() -> dict:
+        """Perform the underlying non-idempotent commit-push-open-PR workflow."""
+        repo = GitRepoClient.for_path(repo_path)
 
-    # Check for changes
-    if not repo.is_dirty(untracked_files=True):
-        raise ValueError("No changes to commit")
+        if not repo.is_dirty(untracked_files=True):
+            raise ValueError("No changes to commit")
 
-    branch = str(repo.active_branch)
+        branch = str(repo.active_branch)
 
-    # Stage and commit
-    repo.git.add("-A")
-    commit = repo.index.commit(title)
+        repo.git.add("-A")
+        commit = repo.index.commit(title)
 
-    # Push
-    origin = repo.remotes.origin
-    try:
-        origin.push(branch, set_upstream=True)
-    except Exception as push_err:
-        raise RuntimeError(f"Push failed: {push_err}") from push_err
+        origin = repo.remotes.origin
+        try:
+            origin.push(branch, set_upstream=True)
+        except Exception as push_err:
+            raise RuntimeError(f"Push failed: {push_err}") from push_err
 
-    # Create PR
-    gh_repo = GitHubApiClient.instance().get_repo(repo_path)
-    pr = gh_repo.create_pull(title=title, body=body, head=branch, base=base)
+        gh_repo = GitHubApiClient.instance().get_repo(repo_path)
+        pr = gh_repo.create_pull(title=title, body=body, head=branch, base=base)
 
-    if labels:
-        for label in [lbl.strip() for lbl in labels.split(",") if lbl.strip()]:
-            try:
-                pr.add_to_labels(label)
-            except Exception:
-                pass
+        labels_failed = []
+        if labels:
+            for label in [lbl.strip() for lbl in labels.split(",") if lbl.strip()]:
+                try:
+                    pr.add_to_labels(label)
+                except GithubException as exc:
+                    labels_failed.append({"label": label, "error": str(exc)[:200]})
 
-    return {
-        "commit": str(commit.hexsha)[:7],
-        "branch": branch,
-        "pr_number": pr.number,
-        "pr_url": pr.html_url,
-    }
+        return {
+            "commit": str(commit.hexsha)[:7],
+            "branch": branch,
+            "pr_number": pr.number,
+            "pr_url": pr.html_url,
+            "labels_failed": labels_failed,
+        }
+
+    return run_once(
+        "github_auto_commit_and_pr", idempotency_key, _commit_and_open
+    )
 
 
-@mcp.tool()
+@_tool(read_only=False, destructive=False, idempotent=False, open_world=True)
 @mcp_tool_handler
 def github_validate_build(repo_path: str = ".") -> dict:
     """Run project build validation before PR.
@@ -537,7 +768,7 @@ def github_validate_build(repo_path: str = ".") -> dict:
     }
 
 
-@mcp.tool()
+@_tool(read_only=False, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def github_label_issue(
     number: int,
@@ -546,31 +777,40 @@ def github_label_issue(
 ) -> dict:
     """Add labels to an issue or PR.
 
+    Adding a label the issue already carries is a no-op upstream, so this tool
+    is genuinely idempotent and safe to retry without a key.
+
     Args:
         number: Issue or PR number
         labels: Comma-separated label names
         repo_path: Local repo path
+
+    Returns:
+        Dict with issue_number, labels_added, labels_failed (name plus the
+        reason each rejected label could not be attached), and total_labels.
     """
     repo = GitHubApiClient.instance().get_repo(repo_path)
     issue = repo.get_issue(number)
     label_list = [lbl.strip() for lbl in labels.split(",") if lbl.strip()]
 
     added = []
+    failed = []
     for label in label_list:
         try:
             issue.add_to_labels(label)
             added.append(label)
-        except GithubException:
-            pass
+        except GithubException as exc:
+            failed.append({"label": label, "error": str(exc)[:200]})
 
     return {
         "issue_number": number,
         "labels_added": added,
+        "labels_failed": failed,
         "total_labels": [lbl.name for lbl in issue.labels]
     }
 
 
-@mcp.tool()
+@_tool(read_only=False, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def github_create_label(
     repo: str,
@@ -643,7 +883,7 @@ def github_create_label(
         raise
 
 
-@mcp.tool()
+@_tool(read_only=False, destructive=False, idempotent=True, open_world=True)
 @mcp_tool_handler
 def github_create_milestone(
     repo: str,
@@ -741,7 +981,7 @@ def github_create_milestone(
         raise
 
 
-@mcp.tool()
+@_tool(read_only=False, destructive=True, idempotent=False, open_world=True)
 @mcp_tool_handler
 def github_full_merge_cycle(
     number: int,
@@ -777,7 +1017,16 @@ def github_full_merge_cycle(
     # Step 2: Check PR is mergeable
     repo = GitHubApiClient.instance().get_repo(repo_path)
     pr = repo.get_pull(number)
-    if not pr.mergeable:
+    if pr.mergeable is None:
+        return {
+            "success": False,
+            "error": (
+                f"PR #{number} mergeability is still being computed by GitHub. "
+                "Retry shortly; this is not a conflict."
+            ),
+            "steps": steps_completed
+        }
+    if pr.mergeable is False:
         return {
             "success": False,
             "error": f"PR #{number} has conflicts",

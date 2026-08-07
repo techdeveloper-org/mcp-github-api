@@ -47,6 +47,8 @@ Run via `python server.py` — communicates over stdio using the MCP protocol.
 - `mcp_errors.py` — Structured error response helpers
 - `input_validator.py` — Null-byte strip, length limits, prompt injection detection
 - `rate_limiter.py` — Token bucket rate limiter (enable via ENABLE_RATE_LIMITING=1)
+- `idempotency.py` — Atomic (O_CREAT|O_EXCL) idempotency memo backing the optional
+                       `idempotency_key` parameter on non-idempotent create/trigger tools
 
 ---
 
