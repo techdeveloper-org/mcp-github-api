@@ -2,9 +2,10 @@
 
 ![Python 3.8+](https://img.shields.io/badge/Python-3.8%2B-blue)
 ![License: MIT](https://img.shields.io/badge/License-MIT-green)
-![Part of claude-workflow-engine](https://img.shields.io/badge/Part%20of-claude--workflow--engine-lightgrey)
 
 A FastMCP server that exposes GitHub operations as Claude Code tools via stdio JSON-RPC. Provides 14 tools covering the full GitHub development lifecycle: issue creation, branch management, pull request creation and review, merge operations with conflict detection, label and milestone management, build validation, and full automated merge cycles. Part of the [Claude Workflow Engine](https://github.com/techdeveloper-org/claude-workflow-engine) ecosystem of 13 MCP servers.
+
+> **Standalone.** This server has no runtime dependency on any other project. It speaks MCP over stdio and works with any MCP client.
 
 ---
 
@@ -349,7 +350,7 @@ MIT License. See [LICENSE](LICENSE) for details.
 
 ## Related
 
-- [claude-workflow-engine](https://github.com/techdeveloper-org/claude-workflow-engine) — Parent orchestration pipeline
+- [claude-workflow-engine](https://github.com/techdeveloper-org/claude-workflow-engine) — One consumer of this server, not a requirement
 - [mcp-base](https://github.com/techdeveloper-org/mcp-base) — Shared base library used by all 13 servers
 - [mcp-git-ops](https://github.com/techdeveloper-org/mcp-git-ops) — Git operations (branch, commit, push, diff)
 - [mcp-jira-api](https://github.com/techdeveloper-org/mcp-jira-api) — Jira issue tracking integration
