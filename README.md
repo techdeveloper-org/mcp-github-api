@@ -3,7 +3,7 @@
 ![Python 3.8+](https://img.shields.io/badge/Python-3.8%2B-blue)
 ![License: MIT](https://img.shields.io/badge/License-MIT-green)
 
-A FastMCP server that exposes GitHub operations as Claude Code tools via stdio JSON-RPC. Provides 14 tools covering the full GitHub development lifecycle: issue creation, branch management, pull request creation and review, merge operations with conflict detection, label and milestone management, build validation, and full automated merge cycles. Part of the [Claude Workflow Engine](https://github.com/techdeveloper-org/claude-workflow-engine) ecosystem of 13 MCP servers.
+A FastMCP server that exposes GitHub operations as Claude Code tools via stdio JSON-RPC. Provides 18 tools covering the full GitHub development lifecycle: issue creation, lookup, update, and lifecycle (close/reopen), comment read/write, branch management, pull request creation and review, merge operations with conflict detection, label and milestone management, build validation, and full automated merge cycles. Part of the [Claude Workflow Engine](https://github.com/techdeveloper-org/claude-workflow-engine) ecosystem of 13 MCP servers.
 
 > **Standalone.** This server has no runtime dependency on any other project. It speaks MCP over stdio and works with any MCP client.
 
@@ -11,11 +11,11 @@ A FastMCP server that exposes GitHub operations as Claude Code tools via stdio J
 
 ## Features
 
-- Create, list, label, and close GitHub issues
+- Create, get, list, label, update, close, and reopen GitHub issues
 - Create feature branches linked to issues with automatic slug generation
 - Create and merge pull requests (squash, merge, rebase) with `gh` CLI fallback for safety
 - Check PR status, check runs, and merge readiness
-- Add comments to issues and pull requests
+- Add and list comments on issues and pull requests
 - Create repository labels with idempotent behavior (returns existing on 422)
 - Create sprint milestones with optional due dates and idempotent behavior
 - Auto-commit staged changes and open a PR in a single tool call
@@ -31,8 +31,12 @@ A FastMCP server that exposes GitHub operations as Claude Code tools via stdio J
 | Tool | Description | Key Parameters |
 |------|-------------|----------------|
 | `github_create_issue` | Create a GitHub issue | `title`, `body`, `labels`, `assignee`, `repo_path` |
+| `github_get_issue` | Get full detail (title, body, state, labels, comments) for one issue | `number`, `repo_path` |
+| `github_update_issue` | Update an issue's title, body, labels, or assignee | `number`, `title`, `body`, `labels`, `assignee`, `repo_path` |
 | `github_close_issue` | Close an issue with optional closing comment | `number`, `comment`, `repo_path` |
+| `github_reopen_issue` | Reopen a closed issue with optional reopening comment | `number`, `comment`, `repo_path` |
 | `github_add_comment` | Add a comment to an issue or PR | `number`, `body`, `type` (`issue`/`pr`), `repo_path` |
+| `github_list_comments` | List comments on an issue or PR | `number`, `type` (`issue`/`pr`), `repo_path`, `limit` |
 | `github_create_pr` | Create a pull request | `title`, `body`, `head`, `base`, `labels`, `repo_path` |
 | `github_merge_pr` | Merge a PR (PyGithub + gh CLI fallback) | `number`, `method`, `delete_branch`, `commit_message`, `repo_path` |
 | `github_list_issues` | List repository issues with optional filters | `labels`, `state`, `repo_path` |

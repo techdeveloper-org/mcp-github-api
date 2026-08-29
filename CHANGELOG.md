@@ -2,6 +2,16 @@
 
 ## [UNRELEASED]
 
+### Added
+- `github_reopen_issue` — the missing counterpart to `github_close_issue`. Found as a real gap in a live session: a mistakenly-closed issue could not be corrected through this server at all, and had to be reopened by hand on GitHub while the gap was logged as product feedback.
+- `github_get_issue` — full detail (title, body, state, labels, assignees, comment count, timestamps) for a single issue by number. `github_list_issues` returns only a per-issue summary page with no body text, so checking one specific issue's current state or reading its description had no tool to reach for.
+- `github_update_issue` — update an existing issue's title, body, labels, or assignee in place. Only explicitly-passed fields change; `labels` replaces the full label set (PyGithub's `edit()` semantics), unlike `github_label_issue`'s additive behavior.
+- `github_list_comments` — read comments back from an issue or PR. `github_add_comment` could write but nothing could read a comment back. For a PR, reads conversation (issue-style) comments — the same kind `github_add_comment(type="pr")` writes — not inline review comments.
+- 24-test unit suite for all four new tools (`tests/test_github_issue_lifecycle.py`)
+
+### Verified
+- All four new tools dogfooded against the live `techdeveloper-org/shakti-os` repository. `github_get_issue` and `github_list_comments` (read-only) confirmed correct against real issue #34 and #45. `github_reopen_issue` used for real to reopen shakti-os#34, resolving a pending mis-close from the same session that surfaced the missing-reopen gap. `github_update_issue` covered by unit tests only — a live test would have mutated real issue content with no corresponding need.
+
 ## [1.1.0] - 2026-05-30
 
 ### Added

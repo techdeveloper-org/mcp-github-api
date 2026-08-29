@@ -5,12 +5,13 @@ Replaces 8+ subprocess calls in github_integration.py with PyGithub library.
 Backend: PyGithub (primary) + gh CLI fallback for critical operations
 Transport: stdio
 
-Tools (14):
-  github_create_issue, github_close_issue, github_add_comment,
-  github_create_pr, github_merge_pr, github_list_issues, github_get_pr_status,
-  github_create_issue_branch, github_auto_commit_and_pr, github_validate_build,
-  github_label_issue, github_create_label, github_create_milestone,
-  github_full_merge_cycle
+Tools (18):
+  github_create_issue, github_close_issue, github_reopen_issue,
+  github_update_issue, github_add_comment, github_list_comments,
+  github_create_pr, github_merge_pr, github_list_issues, github_get_issue,
+  github_get_pr_status, github_create_issue_branch, github_auto_commit_and_pr,
+  github_validate_build, github_label_issue, github_create_label,
+  github_create_milestone, github_full_merge_cycle
 """
 
 import json
@@ -247,6 +248,102 @@ def github_close_issue(
 
 @_tool(read_only=False, destructive=False, idempotent=False, open_world=True)
 @mcp_tool_handler
+def github_reopen_issue(
+    number: int,
+    comment: Optional[str] = None,
+    repo_path: str = "."
+) -> dict:
+    """Reopen a closed GitHub issue with optional reopening comment.
+
+    Mirrors github_close_issue in reverse. Reopening is not idempotent in
+    the sense the ``idempotent`` annotation above tracks: calling it twice on
+    an already-open issue is harmless (GitHub accepts a redundant state edit),
+    but it is not safe to blindly retry against an issue whose state a
+    concurrent actor may have since changed again -- the same caution that
+    applies to github_close_issue.
+
+    Args:
+        number: Issue number
+        comment: Optional comment to add before reopening
+        repo_path: Local repo path
+    """
+    repo = GitHubApiClient.instance().get_repo(repo_path)
+    issue = repo.get_issue(number)
+
+    if comment:
+        issue.create_comment(comment)
+
+    issue.edit(state="open")
+
+    return {
+        "issue_number": number,
+        "state": "open"
+    }
+
+
+@_tool(read_only=False, destructive=False, idempotent=False, open_world=True)
+@mcp_tool_handler
+def github_update_issue(
+    number: int,
+    title: Optional[str] = None,
+    body: Optional[str] = None,
+    labels: Optional[str] = None,
+    assignee: Optional[str] = None,
+    repo_path: str = "."
+) -> dict:
+    """Update an existing issue's title, body, labels, or assignee.
+
+    Fills the gap between github_create_issue (title/body fixed at filing
+    time) and github_label_issue (labels only, additive). Correcting a filed
+    issue's title or body -- a mistaken root-cause name, a status note that
+    belongs in the body rather than a comment -- currently has no tool. Only
+    fields explicitly passed are changed; PyGithub leaves every omitted field
+    as-is. Unlike github_label_issue, a supplied ``labels`` REPLACES the
+    issue's full label set rather than adding to it, matching PyGithub's
+    ``edit(labels=...)`` semantics -- pass the existing labels back if only
+    adding one.
+
+    Args:
+        number: Issue number
+        title: New title, or None to leave unchanged
+        body: New body, or None to leave unchanged
+        labels: Comma-separated label names REPLACING the issue's current
+            labels, or None to leave the label set unchanged
+        assignee: GitHub username to assign, or None to leave unchanged
+        repo_path: Local repo path
+
+    Raises:
+        ValueError: If none of title, body, labels, or assignee is provided --
+            an update with nothing to update is a caller error, not a no-op
+            success.
+    """
+    kwargs = {}
+    if title is not None:
+        kwargs["title"] = title
+    if body is not None:
+        kwargs["body"] = body
+    if labels is not None:
+        kwargs["labels"] = [lbl.strip() for lbl in labels.split(",") if lbl.strip()]
+    if assignee is not None:
+        kwargs["assignee"] = assignee
+
+    if not kwargs:
+        raise ValueError(
+            "At least one of title, body, labels, or assignee must be provided"
+        )
+
+    repo = GitHubApiClient.instance().get_repo(repo_path)
+    issue = repo.get_issue(number)
+    issue.edit(**kwargs)
+
+    return {
+        "issue_number": number,
+        "updated_fields": sorted(kwargs.keys())
+    }
+
+
+@_tool(read_only=False, destructive=False, idempotent=False, open_world=True)
+@mcp_tool_handler
 def github_add_comment(
     number: int,
     body: str,
@@ -273,6 +370,68 @@ def github_add_comment(
     return {
         "comment_url": comment.html_url,
         "type": type
+    }
+
+
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
+@mcp_tool_handler
+def github_list_comments(
+    number: int,
+    type: str = "issue",
+    repo_path: str = ".",
+    limit: int = 100
+) -> dict:
+    """List comments on an issue or pull request.
+
+    github_add_comment can write a comment but nothing on this server could
+    read one back -- a caller checking whether a prior comment landed, or
+    reviewing prior discussion before adding to it, had to leave the tool
+    surface entirely. Mirrors github_list_issues' truncation contract: a
+    caller that checks ``truncated`` is safe, one that assumes a short result
+    is complete is not.
+
+    For a pull request, this returns the conversation (issue-style) comments
+    -- the same comment kind github_add_comment(type="pr") writes -- and NOT
+    inline review comments attached to a diff line, which PyGithub exposes
+    through a separate collection this tool does not read.
+
+    Args:
+        number: Issue or PR number
+        type: 'issue' or 'pr'
+        repo_path: Local repo path
+        limit: Maximum comments to return
+
+    Returns:
+        Dict with ``comments``, ``count``, ``truncated`` and the effective
+        ``limit``.
+    """
+    repo = GitHubApiClient.instance().get_repo(repo_path)
+
+    if type == "pr":
+        comment_source = repo.get_pull(number).get_issue_comments()
+    else:
+        comment_source = repo.get_issue(number).get_comments()
+
+    comments = []
+    truncated = False
+    for comment in comment_source:
+        if len(comments) >= limit:
+            truncated = True
+            break
+        comments.append({
+            "id": comment.id,
+            "author": comment.user.login if comment.user else None,
+            "body": comment.body,
+            "created_at": comment.created_at.isoformat(),
+            "updated_at": comment.updated_at.isoformat(),
+            "html_url": comment.html_url
+        })
+
+    return {
+        "comments": comments,
+        "count": len(comments),
+        "truncated": truncated,
+        "limit": limit
     }
 
 
@@ -509,6 +668,50 @@ def github_list_issues(
         "count": len(issues),
         "truncated": truncated,
         "limit": limit
+    }
+
+
+@_tool(read_only=True, destructive=False, idempotent=True, open_world=True)
+@mcp_tool_handler
+def github_get_issue(number: int, repo_path: str = ".") -> dict:
+    """Get full detail for a single issue by number, including body and state.
+
+    github_list_issues returns a page of per-issue summaries (title, state,
+    labels, created_at) with no body text, so a caller that needs to check
+    one specific issue's current state or read its description has no tool
+    to reach for -- it must re-list and hope the issue is on the first page,
+    or grep a local copy of the issue text that may already be stale.
+
+    Args:
+        number: Issue number
+        repo_path: Local repo path
+
+    Raises:
+        ValueError: If ``number`` identifies a pull request rather than an
+            issue -- GitHub shares one number space between the two, and a PR
+            returned here would silently present as an issue with no body.
+    """
+    repo = GitHubApiClient.instance().get_repo(repo_path)
+    issue = repo.get_issue(number)
+
+    if issue.pull_request is not None:
+        raise ValueError(
+            f"#{number} is a pull request, not an issue. "
+            "Use github_get_pr_status for pull request detail."
+        )
+
+    return {
+        "issue_number": issue.number,
+        "title": issue.title,
+        "body": issue.body or "",
+        "state": issue.state,
+        "labels": [lbl.name for lbl in issue.labels],
+        "assignees": [a.login for a in issue.assignees],
+        "comments": issue.comments,
+        "created_at": issue.created_at.isoformat(),
+        "updated_at": issue.updated_at.isoformat(),
+        "closed_at": issue.closed_at.isoformat() if issue.closed_at else None,
+        "html_url": issue.html_url,
     }
 
 
