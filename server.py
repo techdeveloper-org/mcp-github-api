@@ -950,10 +950,19 @@ def github_validate_build(repo_path: str = ".") -> dict:
         build_cmd = ["cargo", "check"]
 
     if not build_cmd:
+        # No recognized build manifest at repo root is not a build failure --
+        # it is inapplicable (e.g. a monorepo with backend/requirements.txt
+        # and frontend/package.json but nothing at root, or a project with no
+        # single build command at all). `validated=True` here means "nothing
+        # found to block the merge on", matching what github_full_merge_cycle
+        # actually checks (`if not build_result.get("validated")`) -- the
+        # previous `validated=False` made every merge through that tool
+        # unconditionally fail for any repo shaped this way.
         return {
             "build_system": build_system,
-            "validated": False,
-            "message": "No build system detected"
+            "validated": True,
+            "skipped": True,
+            "message": "No build system detected at repo root - skipping build validation"
         }
 
     result = subprocess.run(
