@@ -212,7 +212,8 @@ def github_create_issue(
             "issue_number": issue.number,
             "issue_url": issue.html_url,
             "assignee": assignee,
-            "created_at": issue.created_at.isoformat()
+            "created_at": issue.created_at.isoformat(),
+            "repo_full_name": repo.full_name
         }
 
     return run_once("github_create_issue", idempotency_key, _create)
@@ -242,7 +243,8 @@ def github_close_issue(
 
     return {
         "issue_number": number,
-        "state": "closed"
+        "state": "closed",
+        "repo_full_name": repo.full_name
     }
 
 
@@ -277,7 +279,8 @@ def github_reopen_issue(
 
     return {
         "issue_number": number,
-        "state": "open"
+        "state": "open",
+        "repo_full_name": repo.full_name
     }
 
 
@@ -338,7 +341,8 @@ def github_update_issue(
 
     return {
         "issue_number": number,
-        "updated_fields": sorted(kwargs.keys())
+        "updated_fields": sorted(kwargs.keys()),
+        "repo_full_name": repo.full_name
     }
 
 
@@ -369,7 +373,8 @@ def github_add_comment(
 
     return {
         "comment_url": comment.html_url,
-        "type": type
+        "type": type,
+        "repo_full_name": repo.full_name
     }
 
 
@@ -431,7 +436,8 @@ def github_list_comments(
         "comments": comments,
         "count": len(comments),
         "truncated": truncated,
-        "limit": limit
+        "limit": limit,
+        "repo_full_name": repo.full_name
     }
 
 
@@ -489,7 +495,8 @@ def github_create_pr(
             "pr_number": pr.number,
             "pr_url": pr.html_url,
             "created_at": pr.created_at.isoformat(),
-            "labels_failed": labels_failed
+            "labels_failed": labels_failed,
+            "repo_full_name": repo.full_name
         }
 
     return run_once("github_create_pr", idempotency_key, _create)
@@ -539,7 +546,8 @@ def github_merge_pr(
                 "merged": True,
                 "method": method,
                 "branch_deleted": False,
-                "already_merged": True
+                "already_merged": True,
+                "repo_full_name": repo.full_name
             }
 
         if pr.mergeable is None:
@@ -548,13 +556,15 @@ def github_merge_pr(
                 "error": (
                     f"PR #{number} mergeability is still being computed by "
                     "GitHub. Retry shortly; do not treat this as a conflict."
-                )
+                ),
+                "repo_full_name": repo.full_name
             }
 
         if pr.mergeable is False:
             return {
                 "success": False,
-                "error": f"PR #{number} is not mergeable (conflicts exist)"
+                "error": f"PR #{number} is not mergeable (conflicts exist)",
+                "repo_full_name": repo.full_name
             }
 
         pr.merge(
@@ -576,7 +586,8 @@ def github_merge_pr(
             "pr_number": number,
             "merged": True,
             "method": method,
-            "branch_deleted": branch_deleted
+            "branch_deleted": branch_deleted,
+            "repo_full_name": repo.full_name
         }
         if branch_delete_error:
             result["branch_delete_error"] = branch_delete_error
@@ -667,7 +678,8 @@ def github_list_issues(
         "issues": issues,
         "count": len(issues),
         "truncated": truncated,
-        "limit": limit
+        "limit": limit,
+        "repo_full_name": repo.full_name
     }
 
 
@@ -712,6 +724,7 @@ def github_get_issue(number: int, repo_path: str = ".") -> dict:
         "updated_at": issue.updated_at.isoformat(),
         "closed_at": issue.closed_at.isoformat() if issue.closed_at else None,
         "html_url": issue.html_url,
+        "repo_full_name": repo.full_name,
     }
 
 
@@ -749,7 +762,8 @@ def github_get_pr_status(number: int, repo_path: str = ".") -> dict:
         "base": pr.base.ref,
         "checks": checks,
         "review_comments": pr.review_comments,
-        "commits": pr.commits
+        "commits": pr.commits,
+        "repo_full_name": repo.full_name
     }
 
 
@@ -901,6 +915,7 @@ def github_auto_commit_and_pr(
             "pr_number": pr.number,
             "pr_url": pr.html_url,
             "labels_failed": labels_failed,
+            "repo_full_name": gh_repo.full_name,
         }
 
     return run_once(
@@ -1018,7 +1033,8 @@ def github_label_issue(
         "issue_number": number,
         "labels_added": added,
         "labels_failed": failed,
-        "total_labels": [lbl.name for lbl in issue.labels]
+        "total_labels": [lbl.name for lbl in issue.labels],
+        "repo_full_name": repo.full_name
     }
 
 
@@ -1267,7 +1283,8 @@ def github_full_merge_cycle(
         "pr_number": number,
         "method": method,
         "steps": steps_completed,
-        "message": f"PR #{number} merged successfully"
+        "message": f"PR #{number} merged successfully",
+        "repo_full_name": repo.full_name
     }
 
 
