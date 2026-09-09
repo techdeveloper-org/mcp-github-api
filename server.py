@@ -15,6 +15,7 @@ Tools (18):
 """
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -48,6 +49,24 @@ except ImportError:
     GithubException = Exception  # Fallback so except clauses don't fail
 
 mcp = MCPServer("github-api", instructions="GitHub operations via PyGithub (no subprocess)")
+
+# This server handles one tool call at a time (stdio, synchronous). An
+# origin.fetch()/push() with no timeout can hang forever on a GUI
+# credential-manager prompt nothing in this flow can answer, which freezes
+# every queued tool call behind it -- indistinguishable to the caller from
+# the whole MCP connection having died. 60s is generous for a real network
+# round-trip. GitPython's kill_after_timeout implements this by starting a
+# background thread that SIGKILLs the git subprocess, which is POSIX-only --
+# passing it on Windows raises GitCommandError immediately, so it is only
+# included on non-Windows (see mcp-git-ops server.py, which hit this exact
+# crash and carries the same helper).
+_NETWORK_TIMEOUT_SECONDS = 60
+
+
+def _network_timeout_kwargs() -> dict:
+    if os.name == "nt":
+        return {}
+    return {"kill_after_timeout": _NETWORK_TIMEOUT_SECONDS}
 
 
 def _tool(read_only=False, destructive=True, idempotent=False, open_world=True):
@@ -812,7 +831,7 @@ def github_create_issue_branch(
             had_stash = True
 
         try:
-            origin.fetch("main")
+            origin.fetch("main", **_network_timeout_kwargs())
             repo.git.checkout("-b", branch_name, "FETCH_HEAD")
         except Exception:
             repo.git.checkout("-b", branch_name)
@@ -823,15 +842,24 @@ def github_create_issue_branch(
             except Exception:
                 pass
 
+        push_succeeded = False
+        push_error = None
         try:
-            origin.push(branch_name, set_upstream=True)
-        except Exception:
-            pass
+            origin.push(branch_name, set_upstream=True, **_network_timeout_kwargs())
+            push_succeeded = True
+        except Exception as exc:
+            # Local branch creation above already succeeded -- don't fail the
+            # whole tool call over a push, but don't silently pretend it
+            # worked either; the caller needs to know the branch is
+            # local-only before it references it in a PR or another push.
+            push_error = str(exc)[:300]
 
         return {
             "branch": branch_name,
             "issue_number": issue_number,
-            "stash_restored": had_stash
+            "stash_restored": had_stash,
+            "push_succeeded": push_succeeded,
+            "push_error": push_error
         }
     except RuntimeError:
         # GitPython not available - fallback to subprocess
@@ -894,7 +922,7 @@ def github_auto_commit_and_pr(
 
         origin = repo.remotes.origin
         try:
-            origin.push(branch, set_upstream=True)
+            origin.push(branch, set_upstream=True, **_network_timeout_kwargs())
         except Exception as push_err:
             raise RuntimeError(f"Push failed: {push_err}") from push_err
 
