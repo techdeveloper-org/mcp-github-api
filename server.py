@@ -534,6 +534,25 @@ def github_list_comments(
     }
 
 
+def _find_open_pr(repo, head: str, base: str):
+    """The open PR for one head/base pair, or None.
+
+    GitHub wants `head` qualified as `owner:branch` when filtering, and
+    silently matches nothing when given a bare branch name on some repos, so
+    the qualified form is tried first and the bare form second rather than
+    trusting either.
+    """
+    owner = repo.full_name.split("/", 1)[0]
+    for candidate in (f"{owner}:{head}", head):
+        try:
+            matches = list(repo.get_pulls(state="open", head=candidate, base=base))
+        except GithubException:
+            continue
+        if matches:
+            return matches[0]
+    return None
+
+
 @_tool(read_only=False, destructive=False, idempotent=False, open_world=True)
 @mcp_tool_handler
 def github_create_pr(
@@ -573,7 +592,46 @@ def github_create_pr(
     def _create() -> dict:
         """Perform the underlying non-idempotent pull request creation."""
         repo = GitHubApiClient.instance().get_repo(repo_path)
-        pr = repo.create_pull(title=title, body=body, head=head, base=base)
+        try:
+            pr = repo.create_pull(title=title, body=body, head=head, base=base)
+        except GithubException as exc:
+            # Re-read before reporting, the same way github_merge_pr does and
+            # for the same reason: a write whose response was lost is
+            # indistinguishable from a write that never happened, and the
+            # caller cannot safely retry a non-idempotent call it cannot
+            # classify. POST is deliberately excluded from retries (see
+            # _IDEMPOTENT_METHODS and the duplicate-issue incident it
+            # records), so this is the only way to find out what landed.
+            #
+            # Observed live (#9): five consecutive 500s from GitHub for one
+            # branch, while `gh pr create` succeeded with the identical
+            # head/base. GitHub returns 5xx to the first POST for some
+            # requests; a retry would get the real answer, but retrying a
+            # create is exactly what produced duplicate issues #256/#257 on
+            # claude-workflow-engine. Reading the state is safe; retrying is
+            # not.
+            existing = _find_open_pr(repo, head, base)
+            if existing is not None:
+                return {
+                    "pr_number": existing.number,
+                    "pr_url": existing.html_url,
+                    "created_at": existing.created_at.isoformat(),
+                    "labels_failed": [],
+                    "repo_full_name": repo.full_name,
+                    "found_not_created": True,
+                    "upstream_error": f"{exc.status}",
+                }
+            raise GithubException(
+                exc.status,
+                {
+                    "message": (
+                        f"GitHub returned {exc.status} and no pull request exists for "
+                        f"{head} -> {base}, so nothing was created and a retry is safe."
+                    ),
+                    "upstream_data": exc.data,
+                },
+                exc.headers,
+            ) from exc
 
         labels_failed = []
         if labels:
