@@ -1448,5 +1448,58 @@ def github_full_merge_cycle(
     }
 
 
+def _forbid_unknown_arguments() -> int:
+    """Make an unrecognised tool argument an error, not a silent default.
+
+    The SDK builds each tool's argument model from its signature and sets no
+    `extra` policy, so pydantic's default `ignore` applies and a misspelled
+    argument simply vanishes. That is unacceptable here specifically because
+    the dropped argument decides the shape of irreversible work: a call passing
+    `merge_method="merge"` -- the real parameter is `method` -- was reported
+    back as `"method": "squash"`, having squash-merged a pull request and
+    deleted its branch, with `success: true` and no mention that an argument
+    had been ignored (#10). The same call filed an issue in the wrong
+    repository minutes later, because `repo` is spelled `repo_path`.
+
+    `mcp_tool_handler` cannot catch this: the SDK strips the unknown key before
+    the wrapper's kwargs exist, which is why the existing error handling never
+    fired on either one.
+
+    Returns:
+        How many tool argument models were hardened, for the startup log.
+
+    This reads SDK internals, so every step is guarded and a layout change
+    under either mcp major version degrades to a warning. Refusing to start
+    would be the wrong trade: a server that runs with lenient validation is
+    strictly better than no server, and the warning says which it is.
+    """
+    manager = getattr(mcp, "_tool_manager", None)
+    tools = getattr(manager, "_tools", None)
+    if not isinstance(tools, dict):
+        print(
+            "github-api: WARNING unknown-argument rejection is NOT active: "
+            "the SDK's tool registry is not where this expects it. A misspelled "
+            "argument will silently take its default (see issue #10).",
+            file=sys.stderr,
+        )
+        return 0
+
+    hardened = 0
+    for name, tool in tools.items():
+        model = getattr(getattr(tool, "fn_metadata", None), "arg_model", None)
+        config = getattr(model, "model_config", None)
+        if model is None or not isinstance(config, dict):
+            print(
+                f"github-api: WARNING {name} keeps lenient argument validation",
+                file=sys.stderr,
+            )
+            continue
+        config["extra"] = "forbid"
+        model.model_rebuild(force=True)
+        hardened += 1
+    return hardened
+
+
 if __name__ == "__main__":
+    _forbid_unknown_arguments()
     mcp.run(transport="stdio")
