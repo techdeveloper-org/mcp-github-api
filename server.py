@@ -14,6 +14,8 @@ Tools (18):
   github_create_milestone, github_full_merge_cycle
 """
 
+import contextvars
+import functools
 import json
 import os
 import subprocess
@@ -69,8 +71,70 @@ def _network_timeout_kwargs() -> dict:
     return {"kill_after_timeout": _NETWORK_TIMEOUT_SECONDS}
 
 
+_OPENED_REPOS = contextvars.ContextVar("github_api_opened_repos", default=None)
+
+
+def _open_repo(repo_path: str = "."):
+    """Open a ``git.Repo`` for ``repo_path`` and register it for closing.
+
+    Tools open local repositories through this helper rather than calling
+    ``GitRepoClient.for_path`` directly. Inside a tool call the Repo is recorded
+    so :func:`_closes_opened_repos` closes it when the call ends. An unclosed
+    Repo keeps GitPython's ``git cat-file`` helper processes and its ``.git``
+    handles alive; in this long-lived server on Windows that leaks processes and
+    locks the working tree until the server exits (#8). Outside a tool call the
+    Repo is returned untracked and the caller owns closing it.
+
+    Args:
+        repo_path: Local repository path.
+
+    Returns:
+        A ``git.Repo`` instance.
+
+    Raises:
+        RuntimeError: If GitPython is not installed (from GitRepoClient).
+    """
+    repo = GitRepoClient.for_path(repo_path)
+    opened = _OPENED_REPOS.get()
+    if opened is not None:
+        opened.append(repo)
+    return repo
+
+
+def _closes_opened_repos(fn):
+    """Wrap a tool so every Repo it opened is closed when it returns or raises.
+
+    Args:
+        fn: The tool function, already wrapped by ``mcp_tool_handler``.
+
+    Returns:
+        A wrapper with the same signature that closes the repositories the call
+        opened through :func:`_open_repo`. Its ``__wrapped__`` points at the
+        undecorated tool body (the same object ``mcp_tool_handler`` exposed
+        before this wrapper existed), so tests that call ``tool.__wrapped__`` to
+        observe raw exceptions keep that contract.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        """Run the tool with a fresh open-repo registry, then close each entry."""
+        token = _OPENED_REPOS.set([])
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            for repo in _OPENED_REPOS.get():
+                try:
+                    repo.close()
+                except Exception as exc:
+                    print(f"github-api: failed to close repository handle: {exc}", file=sys.stderr)
+            _OPENED_REPOS.reset(token)
+
+    wrapper.__wrapped__ = getattr(fn, "__wrapped__", fn)
+    return wrapper
+
+
 def _tool(read_only=False, destructive=True, idempotent=False, open_world=True):
-    """Register a tool with explicit MCP ToolAnnotations.
+    """Register a tool with explicit MCP ToolAnnotations and repository cleanup.
 
     The MCP specification's per-hint defaults are readOnlyHint=false,
     destructiveHint=true, idempotentHint=false and openWorldHint=true -- every
@@ -80,6 +144,9 @@ def _tool(read_only=False, destructive=True, idempotent=False, open_world=True):
     whose retry-safety was never actually established. Every tool on this server
     declares its four hints explicitly so that auto-approval and automatic retry
     decisions rest on a stated property rather than on an omission.
+
+    Every tool registered here is also wrapped by :func:`_closes_opened_repos`,
+    so any local repository it opens is closed when the call ends (#8).
 
     Args:
         read_only: True when the tool has no side effects at all.
@@ -92,21 +159,28 @@ def _tool(read_only=False, destructive=True, idempotent=False, open_world=True):
         open_world: True when the tool reaches an external system.
 
     Returns:
-        The decorator returned by the underlying MCP tool registration.
+        A decorator that wraps the tool with repository cleanup and registers it.
     """
     if ToolAnnotations is None:
-        return mcp.tool()
-    try:
-        return mcp.tool(
-            annotations=ToolAnnotations(
-                readOnlyHint=read_only,
-                destructiveHint=destructive,
-                idempotentHint=idempotent,
-                openWorldHint=open_world,
+        register = mcp.tool()
+    else:
+        try:
+            register = mcp.tool(
+                annotations=ToolAnnotations(
+                    readOnlyHint=read_only,
+                    destructiveHint=destructive,
+                    idempotentHint=idempotent,
+                    openWorldHint=open_world,
+                )
             )
-        )
-    except TypeError:  # pragma: no cover - older mcp without annotations kwarg
-        return mcp.tool()
+        except TypeError:  # pragma: no cover - older mcp without annotations kwarg
+            register = mcp.tool()
+
+    def decorator(fn):
+        """Wrap ``fn`` with repository cleanup, then register it with MCP."""
+        return register(_closes_opened_repos(fn))
+
+    return decorator
 
 
 def _gh_cli_merge_fallback(number: int, method: str, delete_branch: bool,
@@ -821,7 +895,7 @@ def github_create_issue_branch(
 
     # Create branch via GitPython or fallback to subprocess
     try:
-        repo = GitRepoClient.for_path(repo_path)
+        repo = _open_repo(repo_path)
         origin = repo.remotes.origin
 
         # Stash if dirty
@@ -910,7 +984,7 @@ def github_auto_commit_and_pr(
     """
     def _commit_and_open() -> dict:
         """Perform the underlying non-idempotent commit-push-open-PR workflow."""
-        repo = GitRepoClient.for_path(repo_path)
+        repo = _open_repo(repo_path)
 
         if not repo.is_dirty(untracked_files=True):
             raise ValueError("No changes to commit")
